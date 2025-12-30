@@ -273,8 +273,8 @@ install_requires = [
 version_range_max = max(sys.version_info[1], 10) + 1
 
 setup(
-    name="diffusers",
-    version="0.36.0",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
+    name="shiva-diffusers",
+    version="0.36.0+shiva",  # expected format is one of x.y.z.dev0, or x.y.z.rc1 or x.y.z (no to dashes, yes to dots)
     description="State-of-the-art diffusion in PyTorch and JAX.",
     long_description=open("README.md", "r", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
