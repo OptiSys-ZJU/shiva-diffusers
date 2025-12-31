@@ -1423,6 +1423,11 @@ class JointAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("JointAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,
@@ -1475,9 +1480,32 @@ class JointAttnProcessor2_0:
             if attn.norm_added_k is not None:
                 encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
 
+            # self-attn's qkv
+            if self._hook is not None:
+                (query, key, value), (
+                    encoder_hidden_states_query_proj,
+                    encoder_hidden_states_key_proj,
+                    encoder_hidden_states_value_proj,
+                ) = self._hook.hook_pre_attn(
+                    self._name,
+                    (query, key, value),
+                    (
+                        encoder_hidden_states_query_proj,
+                        encoder_hidden_states_key_proj,
+                        encoder_hidden_states_value_proj,
+                    ),
+                )
+
             query = torch.cat([query, encoder_hidden_states_query_proj], dim=2)
             key = torch.cat([key, encoder_hidden_states_key_proj], dim=2)
             value = torch.cat([value, encoder_hidden_states_value_proj], dim=2)
+        else:
+            # self-attn's qkv
+            if self._hook is not None:
+                (query, key, value), _ = self._hook.hook_pre_attn(
+                    self._name,
+                    (query, key, value),
+                )
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -1489,8 +1517,14 @@ class JointAttnProcessor2_0:
                 hidden_states[:, : residual.shape[1]],
                 hidden_states[:, residual.shape[1] :],
             )
+
+            if self._hook is not None:
+                hidden_states, encoder_hidden_states = self._hook.hook_after_attn(self._name, hidden_states, encoder_hidden_states)
+
             if not attn.context_pre_only:
                 encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+        else:
+            hidden_states, _ = self._hook.hook_after_attn(self._name, hidden_states)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -2699,6 +2733,11 @@ class AttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self._hook = None
+    
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,
@@ -2759,6 +2798,12 @@ class AttnProcessor2_0:
             query = attn.norm_q(query)
         if attn.norm_k is not None:
             key = attn.norm_k(key)
+        
+        if self._hook is not None:
+            if self._name == 'self-attn':
+                (query, key, value), _ = self._hook.hook_pre_attn(self._name, (query, key, value), None)
+            elif self._name == 'cross-attn':
+                (query, _, _), (_, key, value) = self._hook.hook_pre_attn(self._name, (query, None, None), (None, key, value))
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
@@ -2768,6 +2813,9 @@ class AttnProcessor2_0:
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
+
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_after_attn(self._name, hidden_states, None)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
