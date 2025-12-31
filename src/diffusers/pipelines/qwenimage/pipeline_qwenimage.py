@@ -23,7 +23,7 @@ from ...image_processor import VaeImageProcessor
 from ...loaders import QwenImageLoraLoaderMixin
 from ...models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import deprecate, is_torch_xla_available, logging, replace_example_docstring
+from ...utils import deprecate, is_torch_xla_available, logging, replace_example_docstring, global_context
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import QwenImagePipelineOutput
@@ -176,6 +176,13 @@ class QwenImagePipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         self.prompt_template_encode = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 34
         self.default_sample_size = 128
+
+        global_context.update(
+            model_name="qwen-image",
+            num_layers=self.transformer.config.num_layers,
+            hidden_dim=self.transformer.inner_dim,
+            encoder_hidden_dim=self.transformer.inner_dim,
+        )
 
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()
@@ -677,6 +684,15 @@ class QwenImagePipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            hidden_seq_height=img_shapes[0][0][1],
+            hidden_seq_width=img_shapes[0][0][2],
+            hidden_seq_len=image_seq_len,
+            encoder_hidden_seq_len=txt_seq_lens[0] if txt_seq_lens is not None else None,
+            negative_encoder_hidden_seq_len=negative_txt_seq_lens[0] if negative_txt_seq_lens is not None else None,
+        )
+
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -685,9 +701,15 @@ class QwenImagePipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
+
+                global_context.update(
+                    current_timestep=self._current_timestep, current_iteration=i
+                )
+
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 with self.transformer.cache_context("cond"):
+                    global_context.update(encoder_flag=True)
                     noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep / 1000,
@@ -702,6 +724,7 @@ class QwenImagePipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
                 if do_true_cfg:
                     with self.transformer.cache_context("uncond"):
+                        global_context.update(encoder_flag=False)
                         neg_noise_pred = self.transformer(
                             hidden_states=latents,
                             timestep=timestep / 1000,
@@ -713,6 +736,9 @@ class QwenImagePipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
+                    global_context.update(
+                        last_cfg_hidden_state=(noise_pred - neg_noise_pred).abs(),
+                    )
                     comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
                     cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)

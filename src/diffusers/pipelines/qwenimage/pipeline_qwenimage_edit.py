@@ -24,7 +24,7 @@ from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import QwenImageLoraLoaderMixin
 from ...models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import deprecate, is_torch_xla_available, logging, replace_example_docstring
+from ...utils import deprecate, is_torch_xla_available, logging, replace_example_docstring, global_context
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import QwenImagePipelineOutput
@@ -213,6 +213,13 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         self.prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 64
         self.default_sample_size = 128
+
+        global_context.update(
+            model_name="qwen-image-edit",
+            num_layers=self.transformer.config.num_layers,
+            hidden_dim=self.transformer.inner_dim,
+            encoder_hidden_dim=self.transformer.inner_dim,
+        )
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -798,6 +805,18 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             negative_prompt_embeds_mask.sum(dim=1).tolist() if negative_prompt_embeds_mask is not None else None
         )
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            hidden_seq_height=img_shapes[0][0][1],
+            hidden_seq_width=img_shapes[0][0][2],
+            hidden_seq_len=image_seq_len,
+            hidden_extra_seq_height=img_shapes[0][1][1] if image_latents is not None else None,
+            hidden_extra_seq_width=img_shapes[0][1][2] if image_latents is not None else None,
+            hidden_extra_seq_len= image_latents.shape[1] if image_latents is not None else None,
+            encoder_hidden_seq_len=txt_seq_lens[0] if txt_seq_lens is not None else None,
+            negative_encoder_hidden_seq_len=negative_txt_seq_lens[0] if negative_txt_seq_lens is not None else None,
+        )
+
         # 6. Denoising loop
         self.scheduler.set_begin_index(0)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -807,6 +826,10 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
                 self._current_timestep = t
 
+                global_context.update(
+                    current_timestep=self._current_timestep, current_iteration=i
+                )
+
                 latent_model_input = latents
                 if image_latents is not None:
                     latent_model_input = torch.cat([latents, image_latents], dim=1)
@@ -814,6 +837,7 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 with self.transformer.cache_context("cond"):
+                    global_context.update(encoder_flag=True)
                     noise_pred = self.transformer(
                         hidden_states=latent_model_input,
                         timestep=timestep / 1000,
@@ -829,6 +853,7 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
 
                 if do_true_cfg:
                     with self.transformer.cache_context("uncond"):
+                        global_context.update(encoder_flag=False)
                         neg_noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             timestep=timestep / 1000,
@@ -841,6 +866,9 @@ class QwenImageEditPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
                             return_dict=False,
                         )[0]
                     neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
+                    global_context.update(
+                        last_cfg_hidden_state=(noise_pred - neg_noise_pred).abs(),
+                    )
                     comb_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
                     cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)

@@ -38,6 +38,7 @@ from ...utils import (
     replace_example_docstring,
     scale_lora_layers,
     unscale_lora_layers,
+    global_context
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
@@ -228,6 +229,13 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         )
         self.patch_size = (
             self.transformer.config.patch_size if hasattr(self, "transformer") and self.transformer is not None else 2
+        )
+
+        global_context.update(
+            model_name="sd3",
+            hidden_dim=self.transformer.inner_dim,
+            encoder_hidden_dim=self.transformer.inner_dim,
+            num_layers=self.transformer.config.num_layers,
         )
 
     def _get_t5_prompt_embeds(
@@ -1008,6 +1016,14 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             latents,
         )
 
+        global_context.update(
+            encoder_hidden_seq_len=prompt_embeds.shape[1], # cfg enable, prompt_embeds batch = 2
+            negative_encoder_hidden_seq_len=prompt_embeds.shape[1] if self.do_classifier_free_guidance else None, # cfg enable, prompt_embeds batch = 2
+            hidden_seq_height=(latents.shape[-2] // self.transformer.config.patch_size),
+            hidden_seq_width=(latents.shape[-1] // self.transformer.config.patch_size),
+            hidden_seq_len=(latents.shape[-2] // self.transformer.config.patch_size) * (latents.shape[-1] // self.transformer.config.patch_size)
+        )
+
         # 5. Prepare timesteps
         scheduler_kwargs = {}
         if self.scheduler.config.get("use_dynamic_shifting", None) and mu is None:
@@ -1035,6 +1051,10 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+        )
+
         # 6. Prepare image embeddings
         if (ip_adapter_image is not None and self.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
             ip_adapter_image_embeds = self.prepare_ip_adapter_image_embeds(
@@ -1056,6 +1076,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 if self.interrupt:
                     continue
 
+                global_context.update(current_timestep=t, current_iteration=i)
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
@@ -1073,6 +1095,11 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 # perform guidance
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+
+                    global_context.update(
+                        last_cfg_hidden_state=(noise_pred_uncond - noise_pred_text).abs(),
+                    )
+
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                     should_skip_layers = (
                         True

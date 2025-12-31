@@ -32,6 +32,7 @@ from ...utils import (
     is_torch_xla_available,
     logging,
     replace_example_docstring,
+    global_context
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
@@ -242,6 +243,13 @@ class PixArtSigmaPipeline(DiffusionPipeline):
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
         self.image_processor = PixArtImageProcessor(vae_scale_factor=self.vae_scale_factor)
+
+        global_context.update(
+            num_layers=self.transformer.config.num_layers,
+            model_name="pixart-sigma",
+            hidden_dim=self.transformer.inner_dim,
+            encoder_hidden_dim=self.transformer.inner_dim,
+        )
 
     # Copied from diffusers.pipelines.pixart_alpha.pipeline_pixart_alpha.PixArtAlphaPipeline.encode_prompt with 120->300
     def encode_prompt(
@@ -823,6 +831,15 @@ class PixArtSigmaPipeline(DiffusionPipeline):
             latents,
         )
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            encoder_hidden_seq_len=prompt_embeds.shape[1], # cfg enable, prompt_embeds batch = 2
+            negative_encoder_hidden_seq_len=prompt_embeds.shape[1], # cfg enable, prompt_embeds batch = 2
+            hidden_seq_height=(latents.shape[-2] // self.transformer.config.patch_size),
+            hidden_seq_width=(latents.shape[-1] // self.transformer.config.patch_size),
+            hidden_seq_len=(latents.shape[-2] // self.transformer.config.patch_size) * (latents.shape[-1] // self.transformer.config.patch_size)
+        )
+
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
@@ -838,6 +855,11 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                 current_timestep = t
+
+                global_context.update(
+                    current_timestep=current_timestep, current_iteration=i
+                )
+
                 if not torch.is_tensor(current_timestep):
                     # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
                     # This would be a good case for the `match` statement (Python 3.10+)
@@ -866,6 +888,11 @@ class PixArtSigmaPipeline(DiffusionPipeline):
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    global_context.update(
+                        last_cfg_hidden_state=(
+                            noise_pred_uncond - noise_pred_text
+                        ).abs(),
+                    )
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # learned sigma

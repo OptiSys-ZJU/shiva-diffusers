@@ -38,6 +38,7 @@ from ...utils import (
     replace_example_docstring,
     scale_lora_layers,
     unscale_lora_layers,
+    global_context
 )
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
@@ -214,6 +215,14 @@ class FluxPipeline(
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 77
         )
         self.default_sample_size = 128
+
+        global_context.update(
+            model_name="flux-dev",
+            num_layers=self.transformer.config.num_layers,
+            num_single_layers=self.transformer.config.num_single_layers,
+            hidden_dim=self.transformer.inner_dim,
+            encoder_hidden_dim=self.transformer.inner_dim,
+        )
 
     def _get_t5_prompt_embeds(
         self,
@@ -869,6 +878,15 @@ class FluxPipeline(
         if hasattr(self.scheduler.config, "use_flow_sigmas") and self.scheduler.config.use_flow_sigmas:
             sigmas = None
         image_seq_len = latents.shape[1]
+
+        global_context.update(
+            hidden_seq_height=(height // (self.vae_scale_factor) // 2),
+            hidden_seq_width=(width // (self.vae_scale_factor) // 2),
+            hidden_seq_len=image_seq_len,
+            encoder_hidden_seq_len=prompt_embeds.shape[1],
+            negative_encoder_hidden_seq_len=negative_prompt_embeds.shape[1] if negative_prompt_embeds is not None else None,
+        )
+
         mu = calculate_shift(
             image_seq_len,
             self.scheduler.config.get("base_image_seq_len", 256),
@@ -885,6 +903,10 @@ class FluxPipeline(
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
+
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+        )
 
         # handle guidance
         if self.transformer.config.guidance_embeds:
@@ -935,12 +957,18 @@ class FluxPipeline(
                     continue
 
                 self._current_timestep = t
+
+                global_context.update(
+                    current_timestep=self._current_timestep, current_iteration=i
+                )
+
                 if image_embeds is not None:
                     self._joint_attention_kwargs["ip_adapter_image_embeds"] = image_embeds
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
                 with self.transformer.cache_context("cond"):
+                    global_context.update(encoder_flag=True)
                     noise_pred = self.transformer(
                         hidden_states=latents,
                         timestep=timestep / 1000,
@@ -958,6 +986,7 @@ class FluxPipeline(
                         self._joint_attention_kwargs["ip_adapter_image_embeds"] = negative_image_embeds
 
                     with self.transformer.cache_context("uncond"):
+                        global_context.update(encoder_flag=False)
                         neg_noise_pred = self.transformer(
                             hidden_states=latents,
                             timestep=timestep / 1000,
@@ -969,6 +998,10 @@ class FluxPipeline(
                             joint_attention_kwargs=self.joint_attention_kwargs,
                             return_dict=False,
                         )[0]
+                    
+                    global_context.update(
+                        last_cfg_hidden_state=(noise_pred - neg_noise_pred).abs(),
+                    )
                     noise_pred = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
 
                 # compute the previous noisy sample x_t -> x_t-1

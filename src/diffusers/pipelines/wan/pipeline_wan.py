@@ -23,7 +23,7 @@ from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...loaders import WanLoraLoaderMixin
 from ...models import AutoencoderKLWan, WanTransformer3DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring
+from ...utils import is_ftfy_available, is_torch_xla_available, logging, replace_example_docstring, global_context
 from ...utils.torch_utils import randn_tensor
 from ...video_processor import VideoProcessor
 from ..pipeline_utils import DiffusionPipeline
@@ -153,6 +153,13 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         self.vae_scale_factor_temporal = self.vae.config.scale_factor_temporal if getattr(self, "vae", None) else 4
         self.vae_scale_factor_spatial = self.vae.config.scale_factor_spatial if getattr(self, "vae", None) else 8
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae_scale_factor_spatial)
+
+        global_context.update(
+            model_name="wan",
+            num_layers=self.transformer.config.num_layers,
+            hidden_dim=self.transformer.config.dim,
+            encoder_hidden_dim=self.transformer.config.dim,
+        )
 
     def _get_t5_prompt_embeds(
         self,
@@ -555,6 +562,16 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         mask = torch.ones(latents.shape, dtype=torch.float32, device=device)
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            hidden_seq_height=(latents.shape[-2] // self.transformer.config.patch_size[1]),
+            hidden_seq_width=(latents.shape[-1] // self.transformer.config.patch_size[2]),
+            hidden_seq_frame=(num_frames // self.transformer.config.patch_size[0]),
+            hidden_seq_len=(latents.shape[-2] // self.transformer.config.patch_size[1]) * (latents.shape[-1] // self.transformer.config.patch_size[2]) * (num_frames // self.transformer.config.patch_size[0]),
+            encoder_hidden_seq_len=prompt_embeds.shape[1],
+            negative_encoder_hidden_seq_len=negative_prompt_embeds.shape[1],
+        )
+
         # 6. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
@@ -570,6 +587,10 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     continue
 
                 self._current_timestep = t
+
+                global_context.update(
+                    current_timestep=self._current_timestep, current_iteration=i
+                )
 
                 if boundary_timestep is None or t >= boundary_timestep:
                     # wan2.1 or high-noise stage in wan2.2
@@ -590,6 +611,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                     timestep = t.expand(latents.shape[0])
 
                 with current_model.cache_context("cond"):
+                    global_context.update(encoder_flag=True)
                     noise_pred = current_model(
                         hidden_states=latent_model_input,
                         timestep=timestep,
@@ -600,6 +622,7 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 if self.do_classifier_free_guidance:
                     with current_model.cache_context("uncond"):
+                        global_context.update(encoder_flag=False)
                         noise_uncond = current_model(
                             hidden_states=latent_model_input,
                             timestep=timestep,
@@ -607,6 +630,9 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                             attention_kwargs=attention_kwargs,
                             return_dict=False,
                         )[0]
+                    global_context.update(
+                        last_cfg_hidden_state=(noise_pred - noise_uncond).abs(),
+                    )
                     noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1

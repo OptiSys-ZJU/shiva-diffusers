@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
+from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers, delegated_forward
 from ...utils.torch_utils import maybe_allow_in_graph
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, FeedForward
@@ -272,6 +272,11 @@ class QwenDoubleStreamAttnProcessor2_0:
             raise ImportError(
                 "QwenDoubleStreamAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
             )
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,
@@ -323,6 +328,17 @@ class QwenDoubleStreamAttnProcessor2_0:
             img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
             txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
             txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+        
+        if self._hook is not None:
+            (img_query, img_key, img_value), (
+                txt_query,
+                txt_key,
+                txt_value,
+            ) = self._hook.hook_pre_attn(
+                self._name,
+                (img_query, img_key, img_value),
+                (txt_query, txt_key, txt_value),
+            )
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -349,6 +365,9 @@ class QwenDoubleStreamAttnProcessor2_0:
         # Split attention outputs back
         txt_attn_output = joint_hidden_states[:, :seq_txt, :]  # Text part
         img_attn_output = joint_hidden_states[:, seq_txt:, :]  # Image part
+
+        if self._hook is not None:
+            img_attn_output, txt_attn_output = self._hook.hook_after_attn(self._name, img_attn_output, txt_attn_output)
 
         # Apply output projections
         img_attn_output = attn.to_out[0](img_attn_output)
@@ -403,11 +422,20 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
+        self.attn.processor.register_hook('self-attn', hook)
+        hook.on_register_hook(self)
+
     def _modulate(self, x, mod_params):
         """Apply modulation to input tensor"""
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
 
+    @delegated_forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -425,6 +453,10 @@ class QwenImageTransformerBlock(nn.Module):
         img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
         txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)  # Each [B, 3*dim]
 
+        # self-attn's pre norm
+        if self._hook is not None:
+            hidden_states, encoder_hidden_states, image_rotary_emb = self._hook.hook_pre_norm("self-attn", hidden_states, encoder_hidden_states, image_rotary_emb, temb)
+
         # Process image stream - norm1 + modulation
         img_normed = self.img_norm1(hidden_states)
         img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
@@ -432,6 +464,10 @@ class QwenImageTransformerBlock(nn.Module):
         # Process text stream - norm1 + modulation
         txt_normed = self.txt_norm1(encoder_hidden_states)
         txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+
+        # self-attn's after norm
+        if self._hook is not None:
+            img_modulated, txt_modulated, image_rotary_emb = self._hook.hook_after_norm("self-attn", img_modulated, txt_modulated, image_rotary_emb)
 
         # Use QwenAttnProcessor2_0 for joint attention computation
         # This directly implements the DoubleStreamLayerMegatron logic:
@@ -451,21 +487,41 @@ class QwenImageTransformerBlock(nn.Module):
         # QwenAttnProcessor2_0 returns (img_output, txt_output) when encoder_hidden_states is provided
         img_attn_output, txt_attn_output = attn_output
 
+        img_attn_output = img_gate1 * img_attn_output
+        txt_attn_output = txt_gate1 * txt_attn_output
+
+        # self-attn's after module
+        if self._hook is not None:
+            img_attn_output, txt_attn_output = self._hook.hook_after_module("self-attn", img_attn_output, txt_attn_output)
+
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        hidden_states = hidden_states + img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_attn_output
+
+        # ffn's pre norm
+        if self._hook is not None:
+            hidden_states, encoder_hidden_states = self._hook.hook_pre_norm("ffn", hidden_states, encoder_hidden_states)
 
         # Process image stream - norm2 + MLP
+        # Process text stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
         img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
-        img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
-
-        # Process text stream - norm2 + MLP
         txt_normed2 = self.txt_norm2(encoder_hidden_states)
         txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+
+        # ffn's after norm
+        if self._hook is not None:
+            img_modulated2, txt_modulated2 = self._hook.hook_after_norm("ffn", img_modulated2, txt_modulated2)
+
+        img_mlp_output = img_gate2 * self.img_mlp(img_modulated2)
+        txt_mlp_output = txt_gate2 * self.txt_mlp(txt_modulated2)
+
+        # ffn's after module
+        if self._hook is not None:
+            img_mlp_output, txt_mlp_output = self._hook.hook_after_module('ffn', img_mlp_output, txt_mlp_output)
+
+        hidden_states = hidden_states + img_mlp_output
+        encoder_hidden_states = encoder_hidden_states + txt_mlp_output
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -575,6 +631,8 @@ class QwenImageTransformer2DModel(
         attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_block_samples=None,
         return_dict: bool = True,
+        output_hidden_states: bool = False,
+        output_hidden_states_step: int = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`QwenTransformer2DModel`] forward method.
@@ -632,6 +690,9 @@ class QwenImageTransformer2DModel(
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
+        if output_hidden_states:
+            all_hidden_states = ()
+
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -652,6 +713,9 @@ class QwenImageTransformer2DModel(
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=attention_kwargs,
                 )
+            
+            if output_hidden_states and index_block % output_hidden_states_step == 0:
+                all_hidden_states = all_hidden_states + (hidden_states, )
 
             # controlnet residual
             if controlnet_block_samples is not None:
@@ -668,6 +732,8 @@ class QwenImageTransformer2DModel(
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
+            if output_hidden_states:
+                return (output, all_hidden_states)
             return (output,)
 
         return Transformer2DModelOutput(sample=output)

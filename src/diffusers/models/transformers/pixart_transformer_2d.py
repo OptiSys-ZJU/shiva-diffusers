@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from ...configuration_utils import ConfigMixin, register_to_config
-from ...utils import logging
+from ...utils import logging, global_context
 from ..attention import AttentionMixin, BasicTransformerBlock
 from ..attention_processor import Attention, AttnProcessor, FusedAttnProcessor2_0
 from ..embeddings import PatchEmbed, PixArtAlphaTextProjection
@@ -233,6 +233,8 @@ class PixArtTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin):
         cross_attention_kwargs: Dict[str, Any] = None,
         attention_mask: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+        output_hidden_states_step: int = None,
         return_dict: bool = True,
     ):
         """
@@ -309,9 +311,16 @@ class PixArtTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin):
             timestep, added_cond_kwargs, batch_size=batch_size, hidden_dtype=hidden_states.dtype
         )
 
+        global_context.update(
+            embedded_timestep=embedded_timestep,
+        )
+
         if self.caption_projection is not None:
             encoder_hidden_states = self.caption_projection(encoder_hidden_states)
             encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.shape[-1])
+        
+        if output_hidden_states:
+            all_hidden_states = ()
 
         # 2. Blocks
         for block in self.transformer_blocks:
@@ -336,6 +345,9 @@ class PixArtTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin):
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=None,
                 )
+            
+            if output_hidden_states and index_block % output_hidden_states_step == 0:
+                all_hidden_states = all_hidden_states + (hidden_states, )
 
         # 3. Output
         shift, scale = (
@@ -357,6 +369,8 @@ class PixArtTransformer2DModel(ModelMixin, AttentionMixin, ConfigMixin):
         )
 
         if not return_dict:
+            if output_hidden_states:
+                return (output, all_hidden_states)
             return (output,)
 
         return Transformer2DModelOutput(sample=output)

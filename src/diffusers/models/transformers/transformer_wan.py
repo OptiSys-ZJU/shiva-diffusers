@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import USE_PEFT_BACKEND, deprecate, logging, scale_lora_layers, unscale_lora_layers
+from ...utils import USE_PEFT_BACKEND, deprecate, logging, scale_lora_layers, unscale_lora_layers, global_context
 from ...utils.torch_utils import maybe_allow_in_graph
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, AttentionModuleMixin, FeedForward
@@ -74,6 +74,11 @@ class WanAttnProcessor:
             raise ImportError(
                 "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
             )
+        self._hook = None
+    
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,
@@ -138,6 +143,12 @@ class WanAttnProcessor:
             )
             hidden_states_img = hidden_states_img.flatten(2, 3)
             hidden_states_img = hidden_states_img.type_as(query)
+        
+        if self._hook is not None:
+            if self._name == 'self-attn':
+                (query, key, value), _ = self._hook.hook_pre_attn(self._name, (query, key, value), None)
+            elif self._name == 'cross-attn':
+                (query, _, _), (_, key, value) = self._hook.hook_pre_attn(self._name, (query, None, None), (None, key, value))
 
         hidden_states = dispatch_attention_fn(
             query,
@@ -152,11 +163,17 @@ class WanAttnProcessor:
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
 
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_after_attn(self._name, hidden_states, None)
+
         if hidden_states_img is not None:
             hidden_states = hidden_states + hidden_states_img
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
+
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_after_module(self._name, hidden_states, None)
         return hidden_states
 
 
@@ -339,6 +356,8 @@ class WanTimeTextImageEmbedding(nn.Module):
         temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
         timestep_proj = self.time_proj(self.act_fn(temb))
 
+        global_context.update(pure_temb=timestep_proj)
+
         encoder_hidden_states = self.text_embedder(encoder_hidden_states)
         if encoder_hidden_states_image is not None:
             encoder_hidden_states_image = self.image_embedder(encoder_hidden_states_image)
@@ -454,6 +473,15 @@ class WanTransformerBlock(nn.Module):
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
+        self.attn1.processor.register_hook('self-attn', hook)
+        self.attn2.processor.register_hook('cross-attn', hook)
+        hook.on_register_hook(self)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -461,6 +489,10 @@ class WanTransformerBlock(nn.Module):
         temb: torch.Tensor,
         rotary_emb: torch.Tensor,
     ) -> torch.Tensor:
+        # self-attn's pre norm
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_pre_norm("self-attn", hidden_states, None, None, temb)
+
         if temb.ndim == 4:
             # temb: batch_size, seq_len, 6, inner_dim (wan2.2 ti2v)
             shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
@@ -481,20 +513,41 @@ class WanTransformerBlock(nn.Module):
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
+        # self-attn's after norm
+        if self._hook is not None:
+            hidden_states, _, rotary_emb = self._hook.hook_after_norm("self-attn", hidden_states, None, rotary_emb)
+
         attn_output = self.attn1(norm_hidden_states, None, None, rotary_emb)
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(hidden_states)
 
         # 2. Cross-attention
+        # cross-attn's pre norm
+        if self._hook is not None:
+            hidden_states, encoder_hidden_states = self._hook.hook_pre_norm("cross-attn", hidden_states, encoder_hidden_states)
         norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        # cross-attn's after norm
+        if self._hook is not None:
+            hidden_states, encoder_hidden_states = self._hook.hook_after_norm("cross-attn", hidden_states, encoder_hidden_states)
+
         attn_output = self.attn2(norm_hidden_states, encoder_hidden_states, None, None)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
+        # ffn's pre norm
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_pre_norm("ffn", hidden_states, None)
         norm_hidden_states = (self.norm3(hidden_states.float()) * (1 + c_scale_msa) + c_shift_msa).type_as(
             hidden_states
         )
+        if self._hook is not None:
+            hidden_states, _ = self._hook.hook_after_norm("cross-attn", hidden_states, None)
+
         ff_output = self.ffn(norm_hidden_states)
-        hidden_states = (hidden_states.float() + ff_output.float() * c_gate_msa).type_as(hidden_states)
+        ff_output = ff_output.float() * c_gate_msa
+        # ffn's after module
+        if self._hook is not None:
+            ff_output, _ = self._hook.hook_after_module("ffn", ff_output, None)
+        hidden_states = (hidden_states.float() + ff_output).type_as(hidden_states)
 
         return hidden_states
 

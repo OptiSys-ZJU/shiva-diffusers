@@ -1594,6 +1594,9 @@ class CombinedTimestepTextProjEmbeddings(nn.Module):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))  # (N, D)
 
+        from ..utils import global_context
+        global_context.update(pure_temb=timesteps_emb)
+
         pooled_projections = self.text_embedder(pooled_projection)
 
         conditioning = timesteps_emb + pooled_projections
@@ -1613,6 +1616,9 @@ class CombinedTimestepGuidanceTextProjEmbeddings(nn.Module):
     def forward(self, timestep, guidance, pooled_projection):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))  # (N, D)
+
+        from ..utils import global_context
+        global_context.update(pure_temb=timesteps_emb)
 
         guidance_proj = self.time_proj(guidance)
         guidance_emb = self.guidance_embedder(guidance_proj.to(dtype=pooled_projection.dtype))  # (N, D)
@@ -2176,6 +2182,9 @@ class PixArtAlphaCombinedTimestepSizeEmbeddings(nn.Module):
     def forward(self, timestep, resolution, aspect_ratio, batch_size, hidden_dtype):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_dtype))  # (N, D)
+
+        from ..utils import global_context
+        global_context.update(pure_temb=timesteps_emb)
 
         if self.use_additional_conditions:
             resolution_emb = self.additional_condition_proj(resolution.flatten()).to(hidden_dtype)
