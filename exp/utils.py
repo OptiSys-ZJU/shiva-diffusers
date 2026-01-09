@@ -1,4 +1,10 @@
+import torch
+import numpy as np
+import librosa
 import scipy.signal as signal
+import matplotlib.pyplot as plt
+import io
+from PIL import Image
 
 def calculate_lsd(orig, recon, sr):
     """计算对数谱距离 (Log-Spectral Distance)，衡量频谱包络保真度"""
@@ -30,15 +36,24 @@ def generate_sine_wave(freq, sr, duration=1.0):
 def calculate_metrics(audio_tensor):
     """
     计算 HNR (谐噪比) 和 SNR (信噪比 - 简单估计)
-    audio_tensor: [Channels, Length] cpu numpy
+    audio_tensor: 可能是 [C, T] 的 numpy 数组，也可能是单通道数组
     """
-    y = audio_tensor[0] # 取左声道
+    # 【修复 1】确保是 numpy 数组
+    y = np.asarray(audio_tensor)
+    
+    # 【修复 2】检查维度。如果传入的是 [Channels, Length]，取第一维
+    if y.ndim > 1:
+        y = y[0]
+        
+    # 【修复 3】确保数据是连续内存且为浮点型，这是 librosa 处理的前提
+    y = np.ascontiguousarray(y, dtype=np.float32)
     
     # 1. HNR
+    # librosa.effects.hpss 内部会调用 stft
     harmonic, percussive = librosa.effects.hpss(y)
     hnr = np.sum(harmonic**2) / (np.sum(percussive**2) + 1e-9)
     
-    # 2. RMS Energy (作为简单的信号强度指标)
+    # 2. RMS Energy
     rms = np.sqrt(np.mean(y**2))
     
     return {"hnr": hnr, "rms": rms}

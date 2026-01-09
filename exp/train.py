@@ -132,11 +132,12 @@ def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_t
     if accelerator.is_main_process:
         # 1. 记录音频样本 (Audio Samples)
         for tag, audio_tensor in audio_samples:
-            # add_audio 需要 [1, T] 或 [T]
-            # audio_tensor 是 [2, T] (Stereo)，我们取 mean 变成单声道方便试听，或者保留 Stereo
-            # Tensorboard通常支持 [C, T]，但也可能需要 [1, T]。保险起见转单声道试听。
-            # 如果想听立体声，确保 add_audio 参数 sample_rate 正确
-            tb_tracker.writer.add_audio(f"val_samples/{tag}", audio_tensor, global_step, sample_rate=sr)
+            if audio_tensor.ndim > 1:
+                audio_tensor_1d = audio_tensor.mean(dim=0)
+            else:
+                audio_tensor_1d = audio_tensor
+            audio_tensor_1d = torch.clamp(audio_tensor_1d, -1, 1)
+            tb_tracker.writer.add_audio(f"val_samples/{tag}", audio_tensor_1d, global_step, sample_rate=sr)
 
         # 2. 记录 LSD 组合曲线 (Scalars)
         # 这会将三条线画在同一个图里，方便对比 Trend
