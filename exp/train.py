@@ -68,12 +68,12 @@ class MultiResolutionSTFTLoss(torch.nn.Module):
 def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_tracker):
     sr = vae.config.sampling_rate
     refiner.eval()
-    
+
     val_metrics = {"hnr_gain": [], "lsd_base": [], "lsd_ssa": [], "lsd": [], "sf_reduction": []}
-    
+
     # 用于记录音频样本的容器
     audio_samples = []
-    
+
     progress_bar = tqdm(
         val_loader, 
         desc="Validation", 
@@ -83,16 +83,16 @@ def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_t
     for i, val_batch in enumerate(progress_bar):
         if i >= cfg['validation']['num_val_batches']: break
         v_audio = val_batch['audio'].to(accelerator.device)
-        
+
         with torch.no_grad():
             # 1. 固定采样，确保 Base 和 SSA 面对的是同一个 Latent
             dist = vae.encode(v_audio.to(dtype=torch.float16)).latent_dist
             v_latents = dist.sample() # Sample 一次并固定
-            
+
             v_rec_base = vae.decode(v_latents).sample
             v_refined = refiner(v_latents.to(dtype=torch.float32))
             v_rec_ssa = vae.decode(v_refined.to(dtype=torch.float16)).sample
-        
+
         # 收集第一个 Batch 的音频用于试听
         if i == 0 and accelerator.is_main_process:
             # 取 Batch 里的第一条数据 [C, T]
@@ -104,7 +104,7 @@ def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_t
             base_np = v_rec_base.float().cpu().numpy()
             ssa_np = v_rec_ssa.float().cpu().numpy()
             orig_np = v_audio.float().cpu().numpy()
-            
+
             for b in range(v_audio.shape[0]):
                 ref_raw = np.array(orig_np[b, 0]).flatten().astype(np.float32)
                 base_raw = np.ascontiguousarray(base_np[b, 0], dtype=np.float32)
@@ -114,16 +114,16 @@ def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_t
                 m_b = calculate_metrics(base_raw)
                 m_s = calculate_metrics(ssa_raw)
                 val_metrics["hnr_gain"].append(m_s['hnr'] - m_b['hnr'])
-                
+
                 # 2. LSD (保真度)
                 lsd_base = calculate_lsd(ref_raw, base_raw, sr) # Orig vs Base
                 lsd_ssa = calculate_lsd(ref_raw, ssa_raw, sr)   # Orig vs SSA
                 lsd = calculate_lsd(base_raw, ssa_raw, sr)      # Base vs SSA (核心指标)
-                
+
                 val_metrics["lsd_base"].append(lsd_base)
                 val_metrics["lsd_ssa"].append(lsd_ssa)
                 val_metrics["lsd"].append(lsd)
-                
+
                 # 3. Spectral Flatness
                 sf_b = calculate_spectral_flatness(base_raw)
                 sf_s = calculate_spectral_flatness(ssa_raw)
@@ -152,56 +152,101 @@ def run_validation(refiner, vae, val_loader, cfg, global_step, accelerator, tb_t
         # 3. 物理频点探测 (Probe)
         probe_freqs = [220.0, 440.0, 880.0]
         probe_results = []
-        fig, axes = plt.subplots(len(probe_freqs), 1, figsize=(10, 4 * len(probe_freqs)))
-        if len(probe_freqs) == 1: axes = [axes]
+        dpi = 300
+        fig, axes = plt.subplots(
+            len(probe_freqs), 1, figsize=(12, 5 * len(probe_freqs)), dpi=dpi
+        )
+        if len(probe_freqs) == 1:
+            axes = [axes]
 
         for idx, freq in enumerate(probe_freqs):
-            probe_audio = generate_sine_wave(freq, sr).to(accelerator.device).to(dtype=torch.float16)
+            probe_audio = (
+                generate_sine_wave(freq, sr)
+                .to(accelerator.device)
+                .to(dtype=torch.float16)
+            )
             with torch.no_grad():
-                # 同样的逻辑，采样一次
                 dist = vae.encode(probe_audio).latent_dist
                 p_latents = dist.sample()
-                
+
                 p_rec_base = vae.decode(p_latents).sample.float().cpu().numpy()[0, 0]
                 p_refined_lat = refiner(p_latents.to(dtype=torch.float32))
-                p_rec_ssa = vae.decode(p_refined_lat.to(dtype=torch.float16)).sample.float().cpu().numpy()[0, 0]
-            
-            pur_b, n_b, snr_b, thd_b, f_axis, psd_b = calculate_spectral_purity(p_rec_base, sr, freq=freq)
-            pur_s, n_s, snr_s, thd_s, _, psd_s = calculate_spectral_purity(p_rec_ssa, sr, freq=freq)
-            
+                p_rec_ssa = (
+                    vae.decode(p_refined_lat.to(dtype=torch.float16))
+                    .sample.float()
+                    .cpu()
+                    .numpy()[0, 0]
+                )
+
+            pur_b, n_b, snr_b, thd_b, f_axis, psd_b = calculate_spectral_purity(
+                p_rec_base, sr, freq=freq
+            )
+            pur_s, n_s, snr_s, thd_s, _, psd_s = calculate_spectral_purity(
+                p_rec_ssa, sr, freq=freq
+            )
+
             snr_gain = snr_s - snr_b
             noise_red = (n_b - n_s) / (n_b + 1e-9) * 100
-            probe_results.append({'freq': freq, 'snr_gain': snr_gain, 'noise_red': noise_red})
+            probe_results.append(
+                {"freq": freq, "snr_gain": snr_gain, "noise_red": noise_red}
+            )
 
-            axes[idx].semilogy(f_axis, psd_b, label=f'Base (SNR:{snr_b:.1f}dB)', alpha=0.5, color='gray')
-            axes[idx].semilogy(f_axis, psd_s, label=f'SSA (SNR:{snr_s:.1f}dB)', alpha=0.8, color='red')
+            axes[idx].semilogy(
+                f_axis,
+                psd_b,
+                label=f"Base (SNR:{snr_b:.1f}dB)",
+                alpha=0.4,
+                color="gray",
+                lw=1.2,
+            )
+            axes[idx].semilogy(
+                f_axis,
+                psd_s,
+                label=f"SSA (SNR:{snr_s:.1f}dB)",
+                alpha=0.9,
+                color="red",
+                lw=1.5,
+            )
+
             axes[idx].set_xlim(0, 5000)
-            axes[idx].set_title(f"Probe {freq}Hz | SNR Gain: {snr_gain:+.3f}dB | Noise Red: {noise_red:.2f}%")
-            axes[idx].legend()
+            axes[idx].set_title(
+                f"Probe {freq}Hz | SNR Gain: {snr_gain:+.3f}dB | Noise Red: {noise_red:.2f}%",
+                fontsize=12,
+            )
+            axes[idx].grid(True, which="both", linestyle="--", alpha=0.5)
+            axes[idx].legend(loc="upper right")
 
-        avg_snr_gain = np.mean([r['snr_gain'] for r in probe_results])
-        avg_noise_red = np.mean([r['noise_red'] for r in probe_results])
-        
-        tb_tracker.writer.add_scalar("val_physics/avg_snr_gain_db", avg_snr_gain, global_step)
-        tb_tracker.writer.add_scalar("val_physics/avg_noise_reduction_pct", avg_noise_red, global_step)
-        
+        avg_snr_gain = np.mean([r["snr_gain"] for r in probe_results])
+        avg_noise_red = np.mean([r["noise_red"] for r in probe_results])
+
+        tb_tracker.writer.add_scalar(
+            "val_physics/avg_snr_gain_db", avg_snr_gain, global_step
+        )
+        tb_tracker.writer.add_scalar(
+            "val_physics/avg_noise_reduction_pct", avg_noise_red, global_step
+        )
+
         plt.tight_layout()
         import io
         buf = io.BytesIO()
-        plt.savefig(buf, format='png')
+        plt.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
         plt.close()
         buf.seek(0)
-        img = plt.imread(buf)
-        tb_tracker.writer.add_image("val_physics/spectrum_sweep", img, global_step, dataformats='HWC')
+        from PIL import Image
+        img = Image.open(buf).convert("RGB")
+        img_np = np.array(img)
+        tb_tracker.writer.add_image(
+            "val_physics/spectrum_sweep", img_np, global_step, dataformats="HWC"
+        )
 
     if accelerator.is_main_process:
         avg_total_gain = np.mean(val_metrics["hnr_gain"]) if val_metrics["hnr_gain"] else 0
         tb_tracker.writer.add_scalar("val/avg_hnr_gain_total", avg_total_gain, global_step)
-        
+
         unwrapped_model = accelerator.unwrap_model(refiner)
         m_img = plot_heatmap_to_image(unwrapped_model.rotation.weight.detach().cpu().numpy())
         tb_tracker.writer.add_image("val/m_heatmap", m_img, global_step)
-        
+
         print(f"✨ Step {global_step} | HNR Gain: {avg_total_gain:.2f}% | SNR Gain: {avg_snr_gain:.3f}dB | LSD(vs Base): {np.mean(val_metrics['lsd']):.4f}")
 
     refiner.train()
