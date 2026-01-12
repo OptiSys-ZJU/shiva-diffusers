@@ -616,9 +616,6 @@ class OmniGenTransformer2DModel(ModelMixin, ConfigMixin):
 
         # 3. Rotary position embedding
         image_rotary_emb = self.rope(hidden_states, position_ids)
-        print(image_rotary_emb[0].shape)
-        print(image_rotary_emb[1].shape)
-        exit(0)
 
         # 4. Transformer blocks
         for block in self.layers:
