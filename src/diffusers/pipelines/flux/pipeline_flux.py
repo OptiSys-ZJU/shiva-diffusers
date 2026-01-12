@@ -216,6 +216,9 @@ class FluxPipeline(
         )
         self.default_sample_size = 128
 
+        # set t5 tokenizer max length
+        self.tokenizer_2.model_max_length = 1024
+
         global_context.update(
             model_name="flux-dev",
             num_layers=self.transformer.config.num_layers,
@@ -509,8 +512,8 @@ class FluxPipeline(
                 "If `negative_prompt_embeds` are provided, `negative_pooled_prompt_embeds` also have to be passed. Make sure to generate `negative_pooled_prompt_embeds` from the same text encoder that was used to generate `negative_prompt_embeds`."
             )
 
-        if max_sequence_length is not None and max_sequence_length > 512:
-            raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
+        # if max_sequence_length is not None and max_sequence_length > 512:
+        #     raise ValueError(f"`max_sequence_length` cannot be greater than 512 but is {max_sequence_length}")
 
     @staticmethod
     def _prepare_latent_image_ids(batch_size, height, width, device, dtype):
