@@ -490,8 +490,8 @@ class OmniGenPipeline(
         global_context.update(
             num_inference_steps=num_inference_steps,
             hidden_seq_height=(height // (self.vae_scale_factor) // self.transformer.config.patch_size),
-            hidden_seq_width=(weight // (self.vae_scale_factor) // self.transformer.config.patch_size),
-            hidden_seq_len=(height // (self.vae_scale_factor) // self.transformer.config.patch_size) * (height // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_width=(width // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_len=(height // (self.vae_scale_factor) // self.transformer.config.patch_size) * (width // (self.vae_scale_factor) // self.transformer.config.patch_size),
         )
 
         # 8. Denoising loop
