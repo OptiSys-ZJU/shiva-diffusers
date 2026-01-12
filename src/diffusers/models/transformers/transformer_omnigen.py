@@ -320,9 +320,10 @@ class OmniGenBlock(nn.Module):
     def register_hook(self, name, hook):
         self._name = name
         self._hook = hook
-        self.attn.processor.register_hook('self-attn', hook)
+        self.self_attn.processor.register_hook('self-attn', hook)
         hook.on_register_hook(self)
 
+    @delegated_forward
     def forward(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, image_rotary_emb: torch.Tensor
     ) -> torch.Tensor:
@@ -569,7 +570,6 @@ class OmniGenTransformer2DModel(ModelMixin, ConfigMixin):
                 input_img_inx += 1
         return condition_tokens
 
-    @delegated_forward
     def forward(
         self,
         hidden_states: torch.Tensor,
