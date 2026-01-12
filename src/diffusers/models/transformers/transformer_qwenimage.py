@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
-from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers, delegated_forward
+from ...utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers, delegated_forward, global_context
 from ...utils.torch_utils import maybe_allow_in_graph
 from .._modeling_parallel import ContextParallelInput, ContextParallelOutput
 from ..attention import AttentionMixin, FeedForward
@@ -151,6 +151,8 @@ class QwenTimestepProjEmbeddings(nn.Module):
     def forward(self, timestep, hidden_states):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))  # (N, D)
+
+        global_context.update(pure_temb=timesteps_emb)
 
         conditioning = timesteps_emb
 
