@@ -45,6 +45,9 @@ class PipelineContext:
     # for Shiva, we need to temb which is not merged with encoder_hiddens
     pure_temb: Optional[torch.Tensor] = None
 
+    # for OmniGen
+    time_seq_len: Optional[int] = None
+
     train_step_idx: Optional[int] = None
 
     def hidden_seq_len_gen(self) -> int:

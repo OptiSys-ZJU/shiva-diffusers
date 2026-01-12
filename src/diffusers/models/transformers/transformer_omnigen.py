@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from ...configuration_utils import ConfigMixin, register_to_config
-from ...utils import logging
+from ...utils import logging, delegated_forward, global_context
 from ..attention_processor import Attention
 from ..embeddings import TimestepEmbedding, Timesteps, get_2d_sincos_pos_embed
 from ..modeling_outputs import Transformer2DModelOutput
@@ -194,6 +194,12 @@ class OmniGenAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
 
     def __call__(
         self,
@@ -227,8 +233,56 @@ class OmniGenAttnProcessor2_0:
 
             query = apply_rotary_emb(query, image_rotary_emb, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real_unbind_dim=-2)
+        
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            encoder_query = query[:, :, :enc_len, :]
+            real_query    = query[:, :, enc_len + time_len :, :] 
+            encoder_key   = key[:, :, :enc_len, :]
+            real_key      = key[:, :, enc_len + time_len :, :]
+            encoder_value = value[:, :, :enc_len, :]
+            real_value    = value[:, :, enc_len + time_len :, :]
+
+
+            (real_query, real_key, real_value), (
+                encoder_query,
+                encoder_key,
+                encoder_value,
+            ) = self._hook.hook_pre_attn(
+                self._name,
+                (real_query, real_key, real_value),
+                (
+                    encoder_query,
+                    encoder_key,
+                    encoder_value,
+                ),
+            )
+
+            # In-place
+            query[:, :, :enc_len, :] = encoder_query
+            query[:, :, enc_len + time_len :, :] = real_query
+            key[:, :, :enc_len, :] = encoder_key
+            key[:, :, enc_len + time_len :, :] = real_key
+            value[:, :, :enc_len, :] = encoder_value
+            value[:, :, enc_len + time_len :, :] = real_value
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
+
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            encoder_hidden_states = hidden_states[:, :, :enc_len, :]
+            real_hidden_states    = hidden_states[:, :, enc_len + time_len :, :] 
+
+            real_hidden_states, encoder_hidden_states = self._hook.hook_after_attn(self._name, real_hidden_states, encoder_hidden_states)
+
+            # In-place
+            hidden_states[:, :, :enc_len, :] = encoder_hidden_states
+            hidden_states[:, :, enc_len + time_len :, :] = real_hidden_states
+
         hidden_states = hidden_states.transpose(1, 2).type_as(query)
         hidden_states = hidden_states.reshape(bsz, q_len, attn.out_dim)
         hidden_states = attn.to_out[0](hidden_states)
@@ -261,22 +315,132 @@ class OmniGenBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
         self.mlp = OmniGenFeedForward(hidden_size, intermediate_size)
 
+        self._hook = None
+
+    def register_hook(self, name, hook):
+        self._name = name
+        self._hook = hook
+        self.attn.processor.register_hook('self-attn', hook)
+        hook.on_register_hook(self)
+
     def forward(
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, image_rotary_emb: torch.Tensor
     ) -> torch.Tensor:
         # 1. Attention
+        # self-attn's pre norm
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            encoder_hidden_states = hidden_states[:, :enc_len, :]
+            temb                  = hidden_states[:, enc_len : enc_len + time_len, :]
+            real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
+
+            real_hidden_states, encoder_hidden_states, image_rotary_emb = self._hook.hook_pre_norm(
+                "self-attn", 
+                real_hidden_states,
+                encoder_hidden_states,
+                image_rotary_emb,
+                temb.squeeze(1)
+            )
+
+            # In-place
+            hidden_states[:, :enc_len, :] = encoder_hidden_states
+            hidden_states[:, enc_len : enc_len + time_len, :] = temb
+            hidden_states[:, enc_len + time_len :, :] = real_hidden_states
+            
+            # hidden_states = torch.cat([encoder_hidden_states, temb, real_hidden_states], dim=1)
+
         norm_hidden_states = self.input_layernorm(hidden_states)
+
+        # self-attn's after norm
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            norm_encoder_hidden_states = hidden_states[:, :enc_len, :]
+            norm_real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
+            
+
+            norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb = self._hook.hook_after_norm(
+               'self-attn', norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb
+            )
+
+            # In-place
+            norm_hidden_states[:, :enc_len, :] = norm_encoder_hidden_states
+            norm_hidden_states[:, enc_len + time_len :, :] = norm_real_hidden_states
+
         attn_output = self.self_attn(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_hidden_states,
             attention_mask=attention_mask,
             image_rotary_emb=image_rotary_emb,
         )
+
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            context_attn_output = attn_output[:, :enc_len, :]
+            real_attn_output    = attn_output[:, enc_len + time_len :, :] 
+
+            real_attn_output, context_attn_output = self._hook.hook_after_module("self-attn", real_attn_output, context_attn_output)
+
+            # In-place
+            attn_output[:, :enc_len, :] = context_attn_output
+            attn_output[:, enc_len + time_len :, :] = real_attn_output
+
         hidden_states = hidden_states + attn_output
 
         # 2. Feed Forward
+        # ffn's pre norm
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            encoder_hidden_states = hidden_states[:, :enc_len, :]
+            real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
+
+            real_hidden_states, encoder_hidden_states = self._hook.hook_pre_norm("ffn", real_hidden_states, encoder_hidden_states)
+
+            # In-place
+            hidden_states[:, :enc_len, :] = encoder_hidden_states
+            hidden_states[:, enc_len + time_len :, :] = real_hidden_states
+
         norm_hidden_states = self.post_attention_layernorm(hidden_states)
+
+        # ffn's after norm
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            norm_encoder_hidden_states = hidden_states[:, :enc_len, :]
+            norm_real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
+            
+
+            norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb = self._hook.hook_after_norm(
+               'ffn', norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb
+            )
+
+            # In-place
+            norm_hidden_states[:, :enc_len, :] = norm_encoder_hidden_states
+            norm_hidden_states[:, enc_len + time_len :, :] = norm_real_hidden_states
+
         ff_output = self.mlp(norm_hidden_states)
+
+        if self._hook is not None:
+            enc_len = global_context.encoder_hidden_seq_len
+            time_len = global_context.time_seq_len
+            
+            context_ff_output = ff_output[:, :enc_len, :]
+            real_ff_output    = ff_output[:, enc_len + time_len :, :] 
+
+            real_ff_output, context_ff_output = self._hook.hook_after_module("ffn", real_ff_output, context_ff_output)
+
+            # In-place
+            ff_output[:, :enc_len, :] = context_ff_output
+            ff_output[:, enc_len + time_len :, :] = real_ff_output
+
         hidden_states = hidden_states + ff_output
         return hidden_states
 
@@ -405,6 +569,7 @@ class OmniGenTransformer2DModel(ModelMixin, ConfigMixin):
                 input_img_inx += 1
         return condition_tokens
 
+    @delegated_forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -430,6 +595,11 @@ class OmniGenTransformer2DModel(ModelMixin, ConfigMixin):
 
         condition_tokens = self._get_multimodal_embeddings(input_ids, input_img_latents, input_image_sizes)
         if condition_tokens is not None:
+            global_context.update(
+                encoder_hidden_seq_len=condition_tokens.shape[1],
+                time_seq_len=time_token.shape[1],
+                pure_temb=timestep_proj.squeeze(1),
+            )
             hidden_states = torch.cat([condition_tokens, time_token, hidden_states], dim=1)
         else:
             hidden_states = torch.cat([time_token, hidden_states], dim=1)
@@ -446,6 +616,9 @@ class OmniGenTransformer2DModel(ModelMixin, ConfigMixin):
 
         # 3. Rotary position embedding
         image_rotary_emb = self.rope(hidden_states, position_ids)
+        print(image_rotary_emb[0].shape)
+        print(image_rotary_emb[1].shape)
+        exit(0)
 
         # 4. Transformer blocks
         for block in self.layers:

@@ -23,7 +23,7 @@ from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...models.autoencoders import AutoencoderKL
 from ...models.transformers import OmniGenTransformer2DModel
 from ...schedulers import FlowMatchEulerDiscreteScheduler
-from ...utils import deprecate, is_torch_xla_available, is_torchvision_available, logging, replace_example_docstring
+from ...utils import deprecate, is_torch_xla_available, is_torchvision_available, logging, replace_example_docstring, global_context
 from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 
@@ -167,6 +167,13 @@ class OmniGenPipeline(
             self.tokenizer.model_max_length if hasattr(self, "tokenizer") and self.tokenizer is not None else 120000
         )
         self.default_sample_size = 128
+
+        global_context.update(
+            model_name="omnigen",
+            num_layers=self.transformer.config.num_layers,
+            hidden_dim=self.transformer.config.hidden_size,
+            encoder_hidden_dim=None, # for omnigen, all tokens use the hidden dim
+        )
 
     def encode_input_images(
         self,
@@ -480,9 +487,20 @@ class OmniGenPipeline(
             latents,
         )
 
+        global_context.update(
+            num_inference_steps=num_inference_steps,
+            hidden_seq_height=(height // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_width=(weight // (self.vae_scale_factor) // self.transformer.config.patch_size),
+            hidden_seq_len=(height // (self.vae_scale_factor) // self.transformer.config.patch_size) * (height // (self.vae_scale_factor) // self.transformer.config.patch_size),
+        )
+
         # 8. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                global_context.update(
+                    current_timestep=t, current_iteration=i
+                )
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * (num_cfg + 1))
                 latent_model_input = latent_model_input.to(transformer_dtype)
@@ -507,6 +525,10 @@ class OmniGenPipeline(
                 else:
                     cond, uncond = torch.split(noise_pred, len(noise_pred) // 2, dim=0)
                     noise_pred = uncond + guidance_scale * (cond - uncond)
+                
+                global_context.update(
+                    last_cfg_hidden_state=(uncond - cond).abs(),
+                )
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
