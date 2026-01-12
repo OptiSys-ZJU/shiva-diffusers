@@ -233,55 +233,8 @@ class OmniGenAttnProcessor2_0:
 
             query = apply_rotary_emb(query, image_rotary_emb, use_real_unbind_dim=-2)
             key = apply_rotary_emb(key, image_rotary_emb, use_real_unbind_dim=-2)
-        
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            encoder_query = query[:, :, :enc_len, :]
-            real_query    = query[:, :, enc_len + time_len :, :] 
-            encoder_key   = key[:, :, :enc_len, :]
-            real_key      = key[:, :, enc_len + time_len :, :]
-            encoder_value = value[:, :, :enc_len, :]
-            real_value    = value[:, :, enc_len + time_len :, :]
-
-
-            (real_query, real_key, real_value), (
-                encoder_query,
-                encoder_key,
-                encoder_value,
-            ) = self._hook.hook_pre_attn(
-                self._name,
-                (real_query, real_key, real_value),
-                (
-                    encoder_query,
-                    encoder_key,
-                    encoder_value,
-                ),
-            )
-
-            # In-place
-            query[:, :, :enc_len, :] = encoder_query
-            query[:, :, enc_len + time_len :, :] = real_query
-            key[:, :, :enc_len, :] = encoder_key
-            key[:, :, enc_len + time_len :, :] = real_key
-            value[:, :, :enc_len, :] = encoder_value
-            value[:, :, enc_len + time_len :, :] = real_value
 
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
-
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            encoder_hidden_states = hidden_states[:, :, :enc_len, :]
-            real_hidden_states    = hidden_states[:, :, enc_len + time_len :, :] 
-
-            real_hidden_states, encoder_hidden_states = self._hook.hook_after_attn(self._name, real_hidden_states, encoder_hidden_states)
-
-            # In-place
-            hidden_states[:, :, :enc_len, :] = encoder_hidden_states
-            hidden_states[:, :, enc_len + time_len :, :] = real_hidden_states
 
         hidden_states = hidden_states.transpose(1, 2).type_as(query)
         hidden_states = hidden_states.reshape(bsz, q_len, attn.out_dim)
@@ -328,48 +281,7 @@ class OmniGenBlock(nn.Module):
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, image_rotary_emb: torch.Tensor
     ) -> torch.Tensor:
         # 1. Attention
-        # self-attn's pre norm
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            encoder_hidden_states = hidden_states[:, :enc_len, :]
-            temb                  = hidden_states[:, enc_len : enc_len + time_len, :]
-            real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
-
-            real_hidden_states, encoder_hidden_states, image_rotary_emb = self._hook.hook_pre_norm(
-                "self-attn", 
-                real_hidden_states,
-                encoder_hidden_states,
-                image_rotary_emb,
-                temb.squeeze(1)
-            )
-
-            # In-place
-            hidden_states[:, :enc_len, :] = encoder_hidden_states
-            hidden_states[:, enc_len : enc_len + time_len, :] = temb
-            hidden_states[:, enc_len + time_len :, :] = real_hidden_states
-            
-            # hidden_states = torch.cat([encoder_hidden_states, temb, real_hidden_states], dim=1)
-
         norm_hidden_states = self.input_layernorm(hidden_states)
-
-        # self-attn's after norm
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            norm_encoder_hidden_states = hidden_states[:, :enc_len, :]
-            norm_real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
-            
-
-            norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb = self._hook.hook_after_norm(
-               'self-attn', norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb
-            )
-
-            # In-place
-            norm_hidden_states[:, :enc_len, :] = norm_encoder_hidden_states
-            norm_hidden_states[:, enc_len + time_len :, :] = norm_real_hidden_states
 
         attn_output = self.self_attn(
             hidden_states=norm_hidden_states,
@@ -378,69 +290,11 @@ class OmniGenBlock(nn.Module):
             image_rotary_emb=image_rotary_emb,
         )
 
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            context_attn_output = attn_output[:, :enc_len, :]
-            real_attn_output    = attn_output[:, enc_len + time_len :, :] 
-
-            real_attn_output, context_attn_output = self._hook.hook_after_module("self-attn", real_attn_output, context_attn_output)
-
-            # In-place
-            attn_output[:, :enc_len, :] = context_attn_output
-            attn_output[:, enc_len + time_len :, :] = real_attn_output
-
         hidden_states = hidden_states + attn_output
 
         # 2. Feed Forward
-        # ffn's pre norm
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            encoder_hidden_states = hidden_states[:, :enc_len, :]
-            real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
-
-            real_hidden_states, encoder_hidden_states = self._hook.hook_pre_norm("ffn", real_hidden_states, encoder_hidden_states)
-
-            # In-place
-            hidden_states[:, :enc_len, :] = encoder_hidden_states
-            hidden_states[:, enc_len + time_len :, :] = real_hidden_states
-
         norm_hidden_states = self.post_attention_layernorm(hidden_states)
-
-        # ffn's after norm
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            norm_encoder_hidden_states = hidden_states[:, :enc_len, :]
-            norm_real_hidden_states    = hidden_states[:, enc_len + time_len :, :] 
-            
-
-            norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb = self._hook.hook_after_norm(
-               'ffn', norm_real_hidden_states, norm_encoder_hidden_states, image_rotary_emb
-            )
-
-            # In-place
-            norm_hidden_states[:, :enc_len, :] = norm_encoder_hidden_states
-            norm_hidden_states[:, enc_len + time_len :, :] = norm_real_hidden_states
-
         ff_output = self.mlp(norm_hidden_states)
-
-        if self._hook is not None:
-            enc_len = global_context.encoder_hidden_seq_len
-            time_len = global_context.time_seq_len
-            
-            context_ff_output = ff_output[:, :enc_len, :]
-            real_ff_output    = ff_output[:, enc_len + time_len :, :] 
-
-            real_ff_output, context_ff_output = self._hook.hook_after_module("ffn", real_ff_output, context_ff_output)
-
-            # In-place
-            ff_output[:, :enc_len, :] = context_ff_output
-            ff_output[:, enc_len + time_len :, :] = real_ff_output
 
         hidden_states = hidden_states + ff_output
         return hidden_states
