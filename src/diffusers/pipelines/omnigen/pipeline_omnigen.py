@@ -522,13 +522,17 @@ class OmniGenPipeline(
                 if num_cfg == 2:
                     cond, uncond, img_cond = torch.split(noise_pred, len(noise_pred) // 3, dim=0)
                     noise_pred = uncond + img_guidance_scale * (img_cond - uncond) + guidance_scale * (cond - img_cond)
+
+                    global_context.update(
+                        last_cfg_hidden_state=(img_cond - uncond).abs() + (cond - img_cond).abs(),
+                    )
                 else:
                     cond, uncond = torch.split(noise_pred, len(noise_pred) // 2, dim=0)
                     noise_pred = uncond + guidance_scale * (cond - uncond)
-                
-                global_context.update(
-                    last_cfg_hidden_state=(uncond - cond).abs(),
-                )
+
+                    global_context.update(
+                        last_cfg_hidden_state=(uncond - cond).abs(),
+                    )
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
