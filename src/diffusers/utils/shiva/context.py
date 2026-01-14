@@ -77,7 +77,7 @@ class PipelineContext:
         if self.cfg_mode is None:
             return int(self.encoder_flag)
         else:
-            return cfg_mode
+            return self.cfg_mode
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
