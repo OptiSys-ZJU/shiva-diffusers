@@ -14,9 +14,12 @@ class PipelineContext:
     hidden_seq_width: Optional[int] = None
 
     encoder_flag: Optional[bool] = True
+    cfg_mode: Optional[int] = None # for multi-cfg, like omnigen2
 
     encoder_hidden_seq_len: Optional[int] = None
     negative_encoder_hidden_seq_len: Optional[int] = None
+    cfg_encoder_hidden_seq_len_placeholder_1: Optional[int] = None
+    cfg_encoder_hidden_seq_len_placeholder_2: Optional[int] = None
 
     num_inference_steps: Optional[int] = None
     num_layers: Optional[int] = None
@@ -57,10 +60,18 @@ class PipelineContext:
             return self.hidden_seq_len
 
     def encoder_hidden_seq_len_gen(self) -> int:
-        if self.encoder_flag:
-            return self.encoder_hidden_seq_len
+        if self.cfg_mode is None:
+            # normal branch
+            if self.encoder_flag:
+                return self.encoder_hidden_seq_len
+            else:
+                return self.negative_encoder_hidden_seq_len
         else:
-            return self.negative_encoder_hidden_seq_len
+            # multi-cfg branch
+            if cfg_mode == 0:
+                return self.encoder_hidden_seq_len
+            else:
+                return getattr(self, f'cfg_encoder_hidden_seq_len_placeholder_{cfg_mode}')
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -87,6 +98,8 @@ class PipelineContext:
             "Encoder Seq": [
                 "encoder_hidden_seq_len",
                 "negative_encoder_hidden_seq_len",
+                "cfg_encoder_hidden_seq_len_placeholder_1",
+                "cfg_encoder_hidden_seq_len_placeholder_2",
             ],
             "Edit Extra": [
                 "hidden_extra_seq_len",
