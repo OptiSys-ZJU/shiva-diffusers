@@ -72,6 +72,12 @@ class PipelineContext:
                 return self.encoder_hidden_seq_len
             else:
                 return getattr(self, f'cfg_encoder_hidden_seq_len_placeholder_{cfg_mode}')
+    
+    def encoder_forward_key(self) -> int:
+        if self.cfg_mode is None:
+            return int(self.encoder_flag)
+        else:
+            return cfg_mode
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
